@@ -1,0 +1,401 @@
+
+#
+# Only use core packages for wider compatibility
+#
+import os
+import sys
+import csv
+import urllib
+import math
+
+##################################################
+#
+# User-defined parameters
+
+#	
+# Site, files and and directories
+#
+baseurl ="http://www.opencongress.org"	# Base URL of the data provider
+imgdir  = "HR112img"					# Directory containing the photos
+datadir = "HR112cache"					# Directory for web page caching
+
+#
+# Two representatives will share an edge if their lists of (co-)sponsored bills
+# overlap by at least 'connection_threshold' bills, not considering those that
+# were (co-)sponsored by a fraction of representatives larger than
+# 'popularity_threshold'.
+#
+connection_threshold = 10
+popularity_threshold = .1
+
+###################################################
+#
+# Command line interpretation
+#
+
+#
+# Check the command line: only the output file name should be present.
+#
+if len(sys.argv) == 1 or (len(sys.argv)==3 and sys.argv[1] != "-v") or len(sys.argv) > 3:
+	sys.stderr.write ("Usage:\n\tpython web_mining_politics.py [-v] <outputfilename>\nwhere\n\t-v\tverbose mode\n")
+	exit (10)
+
+verbose = len(sys.argv)==3
+#
+# Retrieve the output filename from the command line; create a temporary filename.
+#
+if verbose:
+	out_filename = sys.argv[2]
+else:
+	out_filename = sys.argv[1]
+tmp_filename = out_filename + "_"
+
+i1 = out_filename.rfind('/')
+i2 = out_filename.rfind('\\')
+if i2 > i1 :
+	i1 = i2
+if i1 >= 0 :
+	out_filedir = out_filename[:i1+1]
+	imgdir = out_filedir + imgdir
+	datadir = out_filedir + datadir
+
+#
+# Create the directories
+#
+try:
+	os.mkdir (imgdir)
+except:
+	pass
+try:
+	os.mkdir (datadir)
+except:
+	pass
+
+def coordtodouble (s):
+	s = s.strip()
+	p1 = s.find("d")
+	d1 = float(s[:p1])
+	p2 = s.find("'")
+	d2 = float(s[p1+1:p2])
+	d = d1 + d2 / 60.0;
+	if s[-1] == 'S' or s[-1] == 'W':
+		d = -d
+	return d
+
+def doubletocoord (v, latlon):
+	if v < 0:
+		v = -v
+		sign = latlon[1]
+	else:
+		sign = latlon[0]
+	deg = int(v)
+	v = 60.0 * (v - deg)
+	min = int(v)
+	v = 60.0 * (v - min)
+	sec = int(v+.5)
+	return "%dd%02d'%02d\"%c" % (deg, min, sec, sign)
+	
+#
+# Open the file with the state bounding boxes
+#
+statelist = {}
+f = open ("US-boxes.csv","r")
+csvf = csv.reader (f, delimiter=',', quotechar='"')
+csvf.next()
+for record in csvf:
+	lgmin = coordtodouble(record[2]);
+	lgmax = coordtodouble(record[3]);
+	ltmax = coordtodouble(record[4]);
+	ltmin = coordtodouble(record[5]);
+	long = .5 * (lgmin + lgmax)
+	lat = .5 * (ltmin + ltmax)
+	dlg = .5 * (lgmax - lgmin)
+	dlt = .5 * (ltmax - ltmin)
+	if dlg < dlt:
+		radius = dlg
+	else:
+		radius = dlt
+	statelist[record[0]] = (record[1], long, lat, radius)
+f.close()
+
+#
+# Download the page with the representatives list,
+# parse it for basic info, download photos
+#
+replist = {}
+filename = datadir + "/base"
+if not os.access (filename, os.R_OK):
+	if verbose:
+		sys.stderr.write ("Retrieving " + filename + "...\n")
+	urllib.urlretrieve (baseurl + "/people/representatives?sort=name", filename)
+elif verbose:
+	sys.stderr.write (filename + " already there, won't retrieve.\n")
+if verbose:
+	sys.stderr.write ("Processing " + filename + "...\n")
+f = open (filename, "r")
+rep = None
+rn = 0
+for line in f:
+	if rep == None:
+		if line.find("/people/show/") >= 0:
+			data = line.split('"')
+			repno = data[1].split("/")[3].split("_")[0]
+			imgname = imgdir + "/" + repno + ".png"
+			rep = [data[1], imgname]
+			if not os.access (imgname, os.R_OK):
+				if verbose:
+					sys.stderr.write ("Retrieving image " + repno + "...\n")
+				urllib.urlretrieve (data[5], imgname)
+				if verbose:
+					sys.stderr.write ("...done.\n");
+			elif verbose:
+				sys.stderr.write ("Image " + repno + " exists, not retrieving.\n")
+			counter = 0
+	elif counter == 0:
+		if line.find("[") >= 0 and line.find("]") >= 0:
+			rep.append (line.strip())
+			counter = 1
+	elif counter == 1:
+		counter = 2
+	else:
+		rep = rep + [line.strip(),[],[],rn]
+		rn = rn + 1
+		replist[repno] = rep
+		rep = None
+f.close()
+
+#
+# Download bills page for each representative.
+# Populate bills collection with sponsors and co-sponsors.
+#
+bills = {}
+count = 1
+for repno,rep in replist.iteritems():
+	page = 1
+	url = baseurl + rep[0].replace("show","bills")
+	if verbose:
+		sys.stderr.write (str(count) + " - Examining bills of " + rep[2] + " (code " + repno + ")\n")
+	count = count + 1
+	while url != None:
+		filename = datadir + "/" + repno + "-" + str(page)
+		if not os.access (filename, os.R_OK):
+			urllib.urlretrieve (url, filename)
+		f = open (filename)
+		url = None
+		sponsored = True
+		for line in f:
+			if line.find ("'cosponsored'") >= 0:
+				sponsored = False
+			else:
+				pos = line.find("class=\"next_page\"")
+				if pos >= 0 and url == None:
+					pos2 = line.find("href=", pos)
+					pos3 = line.find("\"", pos2) + 1
+					pos4 = line.find("\"", pos3)
+					url = baseurl + line[pos3:pos4]
+					page = page + 1
+				elif  line.find("href=\"/bill/112-") >= 0:
+					bill = line.split("/")[2].split("-")[1]
+					if bill in bills:
+						if sponsored:
+							bills[bill][0].append (repno)
+						else:
+							bills[bill][1].append (repno)
+					elif sponsored:
+						bills[bill] = [[repno],[]]
+					else:
+						bills[bill] = [[],[repno]]
+					if sponsored:
+						rep[4].append (bill)
+					else:
+						rep[5].append (bill)
+		f.close()
+nreps = len(replist)
+
+#
+# Compute adjacency matrix with co-sponsors referring to sponsors
+# for each bill.
+#
+if verbose:
+	sys.stderr.write ("Preparing reference matrix\n")
+references = []
+for i in xrange(nreps):
+	references.append([0]*nreps)
+for rep in replist.itervalues():
+	r = rep[6]
+	for bill in rep[4]:
+		if bills[bill] != None:
+			for sprep in bills[bill][1]:
+				cor = replist[sprep][6]
+				references[cor][r] = references[cor][r] + 1
+
+#
+# Row-normalize and transpose the adjacency matrix for PageRank computation
+#
+if verbose:
+	sys.stderr.write ("Transposing...\n")
+norms = map(lambda x: 1.0 / (sum(x)+.00001), references)
+referencesT = []
+for i in xrange(nreps):
+	reft = [0] * nreps
+	for j in xrange(nreps):
+		reft[j] = references[j][i] * norms[j]
+	referencesT.append (reft)
+
+#
+# Compute the PageRank scores by power iterations
+# (won't compute eigenvectors with numpy for better compatibility).
+# Normalize between 0 and 10
+#
+if verbose:
+	sys.stderr.write ("Computing PageRank\n")
+p = [[1.0] * nreps, [1.0] * nreps]
+set = 0
+for t in xrange(50):
+	pset = p[set]
+	for i in xrange(nreps):
+		sum = 0.0
+		reft = referencesT[i]
+		for j in xrange(nreps):
+			sum = sum + reft[j] * pset[j]
+		p[1-set][i] = sum
+	set = 1 - set
+pmax = max(p[1-set])
+p[1-set] = map (lambda x: 10.0 * x / pmax, p[1-set])
+
+#
+# Compute HITS scores by power iterations, normalize.
+#
+if verbose:
+	sys.stderr.write ("Computing HITS\n")
+h = [[1.0] * nreps, [1.0] * nreps]
+a = [[1.0] * nreps, [1.0] * nreps]
+set = 0
+for t in xrange(50):
+	aset = a[set]
+	hset = h[set]
+	for i in xrange(nreps):
+		hsum = 0.0
+		asum = 0.0
+		for j in xrange(nreps):
+			hsum = hsum + references[i][j] * aset[j]
+			asum = asum + references[j][i] * hset[j]
+		a[1-set][i] = asum
+		h[1-set][i] = hsum
+	amax = max(a[1-set])
+	hmax = max(h[1-set])
+	a[1-set] = map (lambda x: x / amax, a[1-set])
+	h[1-set] = map (lambda x: x / hmax, h[1-set])
+	set = 1 - set
+
+#
+# Remove popular bills to reduce the number of represented edgesedges
+#
+if verbose:
+	sys.stderr.write ("Eliminating popular bills\n")
+threshold = popularity_threshold * nreps
+for code,bill in bills.iteritems():
+	if len(bill[0]) + len(bill[1]) > threshold:
+		bills[code] = None
+
+#
+# Purge and sort the bills of each representative
+# (so that the intersection count will be faster)
+#
+if verbose:
+	sys.stderr.write ("Sorting representative bills\n")
+for rep in replist.itervalues():
+	l = []
+	for code in rep[4] + rep[5]:
+		if bills[code] != None:
+			l.append(code)
+	l.sort()
+	rep.append(l)
+
+#
+# Utility function to count the number of common items in two sorted lists
+#
+def intersect (l1, l2):
+	n1 = len(l1)
+	n2 = len(l2)
+	i1 = 0
+	i2 = 0
+	count = 0
+	while i1 < n1 and i2 < n2:
+		if l1[i1] == l2[i2]:
+			count = count + 1
+			i1 = i1 + 1
+			i2 = i2 + 1
+		elif l1[i1] < l2[i2]:
+			i1 = i1 + 1
+		else:
+			i2 = i2 + 1
+	return count
+
+#
+# Output all information in CSV format.
+#
+if verbose:
+	sys.stderr.write ("Creating CSV file\n")
+tmp_file = open(tmp_filename, "wb")
+tmp_csv = csv.writer (tmp_file, delimiter=',', quotechar='"')
+tmp_csv.writerow ([
+	"Name::label",
+	"Group::category",
+	"Sponsored bills::number",
+	"Co-sponsored bills::number",
+	"PageRank::number",
+	"Hub::number",
+	"Authority::number",
+	"Longitude::longitude",
+	"Latitude::latitude",
+	"Image",
+	"G-distances"])
+i = 0
+pset = p[1-set]
+aset = a[1-set]
+hset = h[1-set]
+for rep in replist.itervalues():
+	name = rep[2]
+	p = name.find('-',name.find('['))
+	if p == -1:
+		p = name.find(']')
+		state = name[p-2:p]
+		order = -1.0
+	else:
+		state = name[p-2:p]
+		p2 = name.find(']')
+		order = float(name[p+1:p2])
+	statedata = statelist[state]
+	n = 0
+	radius = 0.0
+	while order > 0:
+		if n == 0:
+			order = order - 1
+		else:
+			order = order - n
+		if order > 0:
+			radius = radius + .3
+			n = n + 6
+	if n > 0:
+		order = -order / n * 6.28
+	longitude = statedata[1] + radius * math.cos(order)
+	latitude = statedata[2] + radius * math.sin(order)
+	row = [rep[2], rep[3], len(rep[4]), len(rep[5]), pset[i], hset[i], aset[i], doubletocoord(longitude,"EW"), doubletocoord(latitude,"NS"), rep[1]]
+	l1 = rep[7]
+	j = 0
+	for rep2 in replist.itervalues():
+		if j >= i:
+			break
+		common = intersect(l1, rep2[7]) - connection_threshold
+		if common > 0:
+			row.append ("%d:%f" % (j+1, math.sqrt(1.0/common)))
+		j = j + 1
+	tmp_csv.writerow(row)
+	i = i + 1
+tmp_file.close()
+
+#
+# Rename the temporary output file into the final one.
+#
+os.rename (tmp_filename, out_filename)
